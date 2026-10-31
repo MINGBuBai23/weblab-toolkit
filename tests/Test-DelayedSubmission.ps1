@@ -10,6 +10,8 @@ $global:WebLabTimingTestclock = [datetime]'2026-01-01T00:00:05'
 $global:WebLabTimingTestrequests = @()
 $global:WebLabTimingTestsleeps = 0
 $global:WebLabTimingTestpassed = 0
+$global:WebLabTimingTestovershoot = 0
+$global:WebLabTimingTestrequestDelay = 0
 
 function Assert($condition, $message) {
     if (-not $condition) { throw $message }
@@ -18,12 +20,13 @@ function Get-Date { return $global:WebLabTimingTestclock }
 function Start-Sleep {
     param([int]$Seconds)
     $global:WebLabTimingTestsleeps++
-    $global:WebLabTimingTestclock = $global:WebLabTimingTestclock.AddSeconds($Seconds)
+    $global:WebLabTimingTestclock = $global:WebLabTimingTestclock.AddSeconds($Seconds + $global:WebLabTimingTestovershoot)
 }
 function Invoke-WebRequest {
     param($Uri, $Method, $Body, $ContentType, $TimeoutSec,
         [switch]$SkipHttpErrorCheck, [switch]$UseBasicParsing, $ErrorAction)
     $global:WebLabTimingTestrequests += [Text.Encoding]::UTF8.GetString($Body)
+    $global:WebLabTimingTestclock = $global:WebLabTimingTestclock.AddSeconds($global:WebLabTimingTestrequestDelay)
     return [pscustomobject]@{ Content = '1'; StatusCode = 200 }
 }
 function New-Start([string]$time, [string]$user = 'test-user', [string]$lab = '163') {
@@ -42,19 +45,26 @@ function Invoke-Case([string]$name, [string]$log, [hashtable]$options,
         [switch]$ExpectFailure, [int]$ExpectedRequests = 1,
         [int]$ExpectedSleep = -1, [string]$ExpectedRealTime = '60',
         [switch]$ExpectNoTimeNode, [switch]$ExpectNoRealTimeNode,
-        [switch]$ExpectUnchangedClock) {
-    $global:WebLabTimingTestclock = [datetime]'2026-01-01T00:00:05'
+        [switch]$ExpectUnchangedClock,
+        [string]$ExpectedError = 'SetLabTimeRecordStart',
+        [datetime]$Clock = [datetime]'2026-01-01T00:00:05',
+        [int]$SleepOvershoot = 0, [int]$RequestDelay = 0) {
+    $global:WebLabTimingTestclock = $Clock
+    $global:WebLabTimingTestovershoot = $SleepOvershoot
+    $global:WebLabTimingTestrequestDelay = $RequestDelay
     $global:WebLabTimingTestrequests = @()
     $global:WebLabTimingTestsleeps = 0
     $logPath = Join-Path $fixtureRoot 'requests.log'
     [IO.File]::WriteAllText($logPath, $log)
     $failure = $null
     try {
-        & $scriptPath -LogPath $logPath -RealTimeMin 60 -RealTimeMax 60 @options -Quiet
+        $invokeOptions = @{LogPath=$logPath; RealTimeMin=60; RealTimeMax=60; Quiet=$true}
+        foreach ($key in $options.Keys) { $invokeOptions[$key] = $options[$key] }
+        & $scriptPath @invokeOptions
     } catch { $failure = $_ }
     if ($ExpectFailure) {
         Assert ($null -ne $failure) "${name}: expected failure"
-        Assert ($failure.Exception.Message -match 'SetLabTimeRecordStart') "${name}: unexpected failure: $failure"
+        Assert ($failure.Exception.Message -match $ExpectedError) "${name}: unexpected failure: $failure"
     } else {
         Assert ($null -eq $failure) "${name}: unexpected failure: $failure"
     }
@@ -63,7 +73,7 @@ function Invoke-Case([string]$name, [string]$log, [hashtable]$options,
         Assert ($global:WebLabTimingTestsleeps -eq $ExpectedSleep) "${name}: wrong sleep count"
     }
     if ($ExpectUnchangedClock) {
-        Assert ($global:WebLabTimingTestclock -eq [datetime]'2026-01-01T00:00:05') "${name}: clock advanced"
+        Assert ($global:WebLabTimingTestclock -eq $Clock) "${name}: clock advanced"
     }
     foreach ($request in $global:WebLabTimingTestrequests) {
         Assert ($request -match '&Content=([^&]+)') "${name}: missing content"
@@ -106,7 +116,27 @@ try {
     Invoke-Case 'dry run rejects missing start' $submission @{WaitRandomTime=$true} -ExpectFailure -ExpectedRequests 0
     Invoke-Case 'report does not require timing' $submission @{Report=$true; WaitRandomTime=$true; Apply=$true} -ExpectedRequests 0 -ExpectedSleep 0
     Invoke-Case 'ordinary apply requires no start' $submission @{Apply=$true} -ExpectedSleep 0 -ExpectedRealTime '7'
-    Invoke-Case 'expired target does not sleep' ((New-Start '2025-12-31 23:58:00.000') + $submission) @{Apply=$true; WaitRandomTime=$true} -ExpectedSleep 0 -ExpectedRealTime '125'
+    Invoke-Case 'expired window rejects small overflow' ((New-Start '2025-12-31 23:58:00.000') + $submission) @{Apply=$true; WaitRandomTime=$true} -ExpectFailure -ExpectedError 'RealTimeMax' -ExpectedRequests 0 -ExpectedSleep 0
+    Invoke-Case 'five hour old session rejected' ($start + $submission) @{Apply=$true; WaitRandomTime=$true; RealTimeMax=3000} -Clock '2026-01-01T05:00:00' -ExpectFailure -ExpectedError 'RealTimeMax' -ExpectedRequests 0 -ExpectedSleep 0
+    Invoke-Case 'previous day session rejected' ($start + $submission) @{Apply=$true; WaitRandomTime=$true; RealTimeMax=3000} -Clock '2026-01-02T00:00:05' -ExpectFailure -ExpectedError 'RealTimeMax' -ExpectedRequests 0 -ExpectedSleep 0
+    Invoke-Case 'keep does not bypass stale window' ($start + $submission) @{Apply=$true; WaitRandomTime=$true; KeepRealTime=$true} -Clock '2026-01-02T00:00:05' -ExpectFailure -ExpectedError 'RealTimeMax' -ExpectedRequests 0
+    Invoke-Case 'dry run rejects stale window' ($start + $submission) @{WaitRandomTime=$true} -Clock '2026-01-02T00:00:05' -ExpectFailure -ExpectedError 'RealTimeMax' -ExpectedRequests 0 -ExpectedSleep 0
+    Invoke-Case 'exact upper bound allowed' ($start + $submission) @{Apply=$true; WaitRandomTime=$true} -Clock '2026-01-01T00:01:00' -ExpectedSleep 0
+    Invoke-Case 'fraction above upper bound rejected' ($start + $submission) @{Apply=$true; WaitRandomTime=$true} -Clock '2026-01-01T00:01:00.001' -ExpectFailure -ExpectedError 'RealTimeMax' -ExpectedRequests 0
+    Invoke-Case 'passed target within upper bound allowed' ((New-Start '2025-12-31 23:58:00.000') + $submission) @{Apply=$true; WaitRandomTime=$true; RealTimeMax=125} -ExpectedSleep 0 -ExpectedRealTime '125'
+    Invoke-Case 'suspend during sleep rejected' ($start + $submission) @{Apply=$true; WaitRandomTime=$true} -SleepOvershoot 18000 -ExpectFailure -ExpectedError 'RealTimeMax' -ExpectedRequests 0 -ExpectedSleep 1
+    Invoke-Case 'keep does not bypass wake check' ($start + $submission) @{Apply=$true; WaitRandomTime=$true; KeepRealTime=$true} -SleepOvershoot 18000 -ExpectFailure -ExpectedError 'RealTimeMax' -ExpectedRequests 0
+    Invoke-Case 'batch stale record blocks all requests' ($start + $submission + (New-Start '2025-12-31 19:00:00.000' 'test-user' '166') + ((New-Submission '2026-01-01 00:00:05.000' '2').Replace('LabID=163', 'LabID=166'))) @{Apply=$true; WaitRandomTime=$true; All=$true} -ExpectFailure -ExpectedError 'RealTimeMax' -ExpectedRequests 0 -ExpectedSleep 0
+    Invoke-Case 'later batch item expires after first request' ($start + $submission + (New-Submission '2026-01-01 00:00:05.000' '2')) @{Apply=$true; WaitRandomTime=$true; All=$true} -RequestDelay 18000 -ExpectFailure -ExpectedError 'RealTimeMax' -ExpectedRequests 1 -ExpectedSleep 1
+    Invoke-Case 'future local clock rejected' ($start + $submission) @{Apply=$true; WaitRandomTime=$true} -Clock '2025-12-31T23:59:59' -ExpectFailure -ExpectedError 'RealTimeMax' -ExpectedRequests 0
+    Invoke-Case 'invalid wait interval rejected' ($start + $submission) @{Apply=$true; WaitRandomTime=$true; RealTimeMin=120; RealTimeMax=60} -ExpectFailure -ExpectedError 'RealTimeMin' -ExpectedRequests 0
+    Invoke-Case 'subminute wait interval rejected' ($start + $submission) @{Apply=$true; WaitRandomTime=$true; RealTimeMin=10} -ExpectFailure -ExpectedError 'RealTimeMin' -ExpectedRequests 0
+    Invoke-Case 'ordinary apply accepts old log unchanged' ($start + $submission) @{Apply=$true} -Clock '2026-01-02T00:00:05' -ExpectedSleep 0 -ExpectedRealTime '7'
+    Invoke-Case 'report ignores stale window' ($start + $submission) @{Report=$true; WaitRandomTime=$true} -Clock '2026-01-02T00:00:05' -ExpectedRequests 0 -ExpectedSleep 0
+    $batchText = [IO.File]::ReadAllText((Join-Path $repo '2-一键刷分.bat'))
+    Assert ($batchText -match '(?m)^powershell[^\r\n]*Invoke-LabPerfect\.ps1" -Apply\s*$') 'one-click entry must use only -Apply'
+    $global:WebLabTimingTestpassed++
+    Write-Host 'PASS one-click entry preserves default time behavior'
     Write-Host "All $global:WebLabTimingTestpassed offline regression cases passed on PowerShell $($PSVersionTable.PSVersion)."
 } finally {
     # Remove only the unique fixture directory created by this test.

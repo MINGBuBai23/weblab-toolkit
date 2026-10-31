@@ -10,6 +10,6 @@ echo   延时重放可用「4-延时刷分.bat」
 echo   延时模式不保证改变网页用时，服务端行为尚未验证
 echo  ============================================
 echo.
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\Invoke-LabPerfect.ps1" -Apply -RandomTime
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\Invoke-LabPerfect.ps1" -Apply
 echo.
 pause

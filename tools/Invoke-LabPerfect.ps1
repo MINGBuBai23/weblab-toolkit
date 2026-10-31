@@ -114,6 +114,14 @@ function Resolve-LabStart($f, $startMap) {
     return $best
 }
 
+# Reject stale sessions before integer conversion or XML mutation; never clamp elapsed time.
+function Assert-WaitWindow([datetime]$startAt, [datetime]$now, [int]$maxSeconds) {
+    $elapsed = ($now - $startAt).TotalSeconds
+    if ($elapsed -lt 0 -or $elapsed -gt $maxSeconds) {
+        throw "延时模式中止：本地经过时间 $elapsed 秒不在 0..RealTimeMax=$maxSeconds 秒内；未发送本条记录。请检查抓包会话和本机时间。"
+    }
+}
+
 # ---------- 1. 从日志切出提交 ----------
 $raw = Get-Content $LogPath -Raw -Encoding UTF8
 $allChunks = [regex]::Split($raw, '(?m)^================ #')
@@ -157,11 +165,16 @@ $startMap = Get-LabStartMap $allChunks
 
 # 延时模式先校验全部待处理记录，避免缺开始时间时直接发送或批量执行到一半才失败。
 if ($WaitRandomTime -and -not $Report) {
+    if ($RealTimeMin -lt 60 -or $RealTimeMax -lt $RealTimeMin) {
+        throw '延时模式要求 60 <= RealTimeMin <= RealTimeMax；未发送任何记录。'
+    }
+    $preflightNow = Get-Date
     foreach ($f in $subs) {
         $startAt = Resolve-LabStart $f $startMap
         if (-not $startAt) {
             throw "延时模式中止：LabID=$($f['LabID']) / RecordID=$($f['RecordID']) 缺少不晚于提交时间的开始记录（SetLabTimeRecordStart）或提交时间戳；未发送任何记录。请补全抓包日志。"
         }
+        Assert-WaitWindow $startAt $preflightNow $RealTimeMax
         $f['__StartAt'] = $startAt
     }
     Log2 '  延时模式只控制本地重放时刻；服务端是否更新结束时间未经验证，网页用时可能保持不变。'
@@ -172,6 +185,7 @@ $tmp = Join-Path ([IO.Path]::GetTempPath()) ("lpf_" + [guid]::NewGuid().ToString
 New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 
 $okCount = 0
+try {
 foreach ($f in $subs) {
     $tag = "{0} / LabID={1} / RecordID={2}" -f $f['LabName'], $f['LabID'], $f['RecordID']
     Log2 ("===== {0} =====" -f $tag)
@@ -277,6 +291,7 @@ foreach ($f in $subs) {
     if ($WaitRandomTime) {
         $startAt = $f['__StartAt']
         if ($startAt) {
+            Assert-WaitWindow $startAt (Get-Date) $RealTimeMax
             $want = Get-RandomRealTime -MinSeconds $RealTimeMin -MaxSeconds $RealTimeMax
             $targetAt = $startAt.AddSeconds($want)
             Log2 ("  进实验时间 {0}，目标用时 {1} 分 {2:00} 秒 → 计划 {3} 提交" -f $startAt.ToString('HH:mm:ss'), [int][Math]::Floor($want / 60), ($want % 60), $targetAt.ToString('HH:mm:ss'))
@@ -289,11 +304,10 @@ foreach ($f in $subs) {
                     Log2 ("    等待中… 还剩 {0} 分 {1:00} 秒" -f [int][Math]::Floor($remain / 60), ($remain % 60))
                     Start-Sleep -Seconds ([Math]::Min(60, [Math]::Max(1, $remain)))
                 }
-                $waitRt = [int][Math]::Max(1, [Math]::Floor(((Get-Date) - $startAt).TotalSeconds))
+                $afterWait = Get-Date
+                Assert-WaitWindow $startAt $afterWait $RealTimeMax
+                $waitRt = [int][Math]::Max(1, [Math]::Floor(($afterWait - $startAt).TotalSeconds))
                 Log2 ("  本地提交时刻 {0}，距日志开始时间 {1} 分 {2:00} 秒（不代表服务端用时）" -f (Get-Date).ToString('HH:mm:ss'), [int][Math]::Floor($waitRt / 60), ($waitRt % 60))
-                if ($waitRt -gt $RealTimeMax) {
-                    Log2 ("  注意：本地实际已过 {0} 分钟，超过设定的上限 {1} 分钟" -f [int][Math]::Floor($waitRt / 60), [int][Math]::Floor($RealTimeMax / 60))
-                }
             } else {
                 $waitRt = $want
                 Log2 "  [DryRun] 不加 -Apply 不会真的等；真正提交时会等到上面那个时间点"
@@ -344,6 +358,8 @@ foreach ($f in $subs) {
         Log2 ("  [DryRun] 报文 {0} 字节，未发送" -f $body.Length)
         continue
     }
+    # Encoding and earlier batch items can consume time after preflight/waiting.
+    if ($WaitRandomTime) { Assert-WaitWindow $f['__StartAt'] (Get-Date) $RealTimeMax }
 
     $server = "http://192.168.2.221:8001"
     if ($f.ContainsKey('ServerIP') -and $f['ServerIP']) { $server = $f['ServerIP'] }
@@ -381,8 +397,9 @@ foreach ($f in $subs) {
     Log2 ("  重放 -> HTTP {0}  响应={1}（{2}）" -f $status, $code, $meaning)
     if ($code.Trim() -eq '1') { $okCount++ }
 }
-
+} finally {
 Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+}
 Log2 ""
 if ($Apply) { Log2 ("完成：{0}/{1} 条成功" -f $okCount, $subs.Count) }
 else { Log2 "以上为预览。加 -Apply 才会真正提交。" }
