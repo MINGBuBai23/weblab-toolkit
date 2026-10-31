@@ -89,7 +89,11 @@
 cd tools
 .\Invoke-LabPerfect.ps1 -Apply -All         # 处理日志里所有实验（自动去重）
 .\Invoke-LabPerfect.ps1 -Report -Last 5     # 只看评分结构，判断上限
-.\Invoke-LabPerfect.ps1 -Apply -RealTime 1800   # 顺便把用时改成 30 分钟
+.\Invoke-LabPerfect.ps1 -Apply -WaitRandomTime    # 页面「用时」由服务端算：等到「开始+30~50 分钟」再提交
+.\Invoke-LabPerfect.ps1 -Apply -RandomTime      # 只改 XML 里的 RealTime（页面用时不变）
+.\Invoke-LabPerfect.ps1 -Apply -RandomTime -RealTimeMin 1500 -RealTimeMax 2400   # 自定义 25~40 分钟
+.\Invoke-LabPerfect.ps1 -Apply -RealTime 1800   # 固定 30 分钟
+.\Invoke-LabPerfect.ps1 -Apply -KeepRealTime    # 保留包里的原始用时（默认行为）
 ```
 
 ---

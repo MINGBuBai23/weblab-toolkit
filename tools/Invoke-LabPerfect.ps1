@@ -19,7 +19,13 @@ param(
     [switch]$Apply,            # 不加 = DryRun
     [switch]$All,              # 处理全部提交，默认只处理最新一条
     [int]$Last = 1,            # 只处理最近 N 条（-All 优先）
-    [int]$RealTime = -1,       # >0 则把 RealTime 改成这个秒数
+    [int]$RealTime = -1,       # >0 则把 RealTime 改成这个固定秒数
+    [switch]$RandomTime,       # 随机用时：在 RealTimeMin ~ RealTimeMax 之间随机
+    [switch]$WaitRandomTime,   # 页面「用时」= 服务端（提交时间-进实验时间），所以先等到「开始+随机时长」再提交
+    [int]$RealTimeMin = 1800,  # 随机下限（秒）1800 = 30 分钟
+    [int]$RealTimeMax = 3000,  # 随机上限（秒）3000 = 50 分钟
+    [switch]$KeepRealTime,     # 保留包里原始用时，不做任何修改
+    [string]$OnlyLab = '',     # 只处理某个 LabID（例：-OnlyLab 163 只刷示波器）
     [switch]$Quiet,
     [switch]$Report            # 只看评分结构，不提交
 )
@@ -41,13 +47,85 @@ function Test-Placeholder([string]$v) {
     return $false
 }
 
+# 随机用时：在 [MinSeconds, MaxSeconds] 内取一个"像真人"的秒数
+#   先随机分钟数（30~50 分钟），再随机 0~59 秒，最后夹到区间内
+#   避免每次都出现 1800 / 2700 / 3000 这种整数分钟，看起来更自然
+function Get-RandomRealTime {
+    param(
+        [int]$MinSeconds = 1800,
+        [int]$MaxSeconds = 3000
+    )
+    if ($MinSeconds -gt $MaxSeconds) {
+        $t = $MinSeconds; $MinSeconds = $MaxSeconds; $MaxSeconds = $t
+    }
+    if ($MinSeconds -lt 60) { $MinSeconds = 60 }
+    if ($MaxSeconds -lt $MinSeconds) { $MaxSeconds = $MinSeconds }
+
+    $lo = [int][Math]::Floor($MinSeconds / 60)
+    $hi = [int][Math]::Floor($MaxSeconds / 60)
+    if ($hi -lt $lo) { $hi = $lo }
+    # 让「分钟 + 0~59 秒」整段都落在上限内，避免结果被夹到 MaxSeconds 这个整数分钟上
+    $hiFull = [int][Math]::Floor(($MaxSeconds - 59) / 60)
+    if ($hiFull -ge $lo -and $hiFull -lt $hi) { $hi = $hiFull }
+
+    $minutes = Get-Random -Minimum $lo -Maximum ($hi + 1)
+    $seconds = Get-Random -Minimum 0 -Maximum 60
+    $total = $minutes * 60 + $seconds
+
+    if ($total -gt $MaxSeconds) { $total = $MaxSeconds }
+    if ($total -lt $MinSeconds) { $total = $MinSeconds }
+    return [int]$total
+}
+
+# 抓包日志里每条请求前面的时间戳（本机时间，HttpSpy 写的）
+function Get-ChunkTime($chunk) {
+    if ($chunk -match '(?m)^#?(\d+)\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3})') {
+        return [datetime]::ParseExact($Matches[2], 'yyyy-MM-dd HH:mm:ss.fff', [Globalization.CultureInfo]::InvariantCulture)
+    }
+    return $null
+}
+
+# 捞出所有「开始实验」记录：客户端进实验时会调 /ServiceAPI/SetLabTimeRecordStart
+#   返回 @{ "USERID|LABID" = List[datetime] }
+function Get-LabStartMap($chunkList) {
+    $map = @{}
+    foreach ($c in $chunkList) {
+        if ($c -notmatch 'POST http://[^/]+/ServiceAPI/SetLabTimeRecordStart') { continue }
+        $t = Get-ChunkTime $c
+        if (-not $t) { continue }
+        if ($c -match 'USERID=([^&\r\n]+)&LABID=([^&\r\n]+)') {
+            $k = "$($Matches[1])|$($Matches[2])"
+            if (-not $map.ContainsKey($k)) { $map[$k] = New-Object 'System.Collections.Generic.List[datetime]' }
+            $map[$k].Add($t)
+        }
+    }
+    return $map
+}
+
+# 找某条提交对应的开始时间：同 USERID|LABID 下、不晚于提交时间的那一条
+function Resolve-LabStart($f, $startMap) {
+    if (-not $f['__Time']) { return $null }
+    $k = "$($f['UserID'])|$($f['LabID'])"
+    if (-not $startMap.ContainsKey($k)) { return $null }
+    $best = $null
+    foreach ($t in $startMap[$k]) {
+        if ($t -le $f['__Time'].AddMinutes(1) -and (-not $best -or $t -gt $best)) { $best = $t }
+    }
+    return $best
+}
+
 # ---------- 1. 从日志切出提交 ----------
 $raw = Get-Content $LogPath -Raw -Encoding UTF8
-$chunks = [regex]::Split($raw, '(?m)^================ #') | Where-Object { $_ -match 'POST http://[^/]+/ServiceAPI/UpdateRecord' }
+$allChunks = [regex]::Split($raw, '(?m)^================ #')
+$chunks = $allChunks | Where-Object { $_ -match 'POST http://[^/]+/ServiceAPI/UpdateRecord' }
 if (-not $chunks) { throw "日志里没有 /ServiceAPI/UpdateRecord 提交（确认抓包时确实结束过实验）" }
 
 $subs = @()
 foreach ($c in $chunks) {
+    $cTime = $null
+    if ($c -match '(?m)^#?(\d+)\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3})') {
+        $cTime = [datetime]::ParseExact($Matches[2], 'yyyy-MM-dd HH:mm:ss.fff', [Globalization.CultureInfo]::InvariantCulture)
+    }
     if ($c -match '(?s)---- body \((\d+) bytes\) ----\r?\n(.*)$') {
         $bodyText = $Matches[2].Trim()
         if ($bodyText -notmatch 'UserID=') { continue }
@@ -56,7 +134,7 @@ foreach ($c in $chunks) {
             $i = $kv.IndexOf('=')
             if ($i -gt 0) { $f[$kv.Substring(0, $i)] = $kv.Substring($i + 1) }
         }
-        if ($f.ContainsKey('Content') -and $f.ContainsKey('Key')) { $subs += , $f }
+        if ($f.ContainsKey('Content') -and $f.ContainsKey('Key')) { $f['__Time'] = $cTime; $subs += , $f }
     }
 }
 if (-not $subs) { throw "没能从日志里解析出提交体" }
@@ -66,11 +144,16 @@ $subs = @($subs | Where-Object {
             $k = "$($_['RecordID'])|$($_['FileName'])"
             if ($seen.ContainsKey($k)) { $false } else { $seen[$k] = 1; $true }
         })
+if ($OnlyLab) {
+    $subs = @($subs | Where-Object { [string]$_['LabID'] -eq $OnlyLab })
+    if (-not $subs) { throw "日志里没有 LabID=$OnlyLab 的提交" }
+}
 if (-not $All) {
     if ($Last -lt 1) { $Last = 1 }
     if ($Last -lt $subs.Count) { $subs = @($subs[($subs.Count - $Last)..($subs.Count - 1)]) }
 }
 Log2 ("找到 {0} 条提交（本次处理 {1} 条）" -f $chunks.Count, $subs.Count)
+$startMap = Get-LabStartMap $allChunks
 
 # ---------- 2. 逐条处理 ----------
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ("lpf_" + [guid]::NewGuid().ToString('N'))
@@ -177,9 +260,63 @@ foreach ($f in $subs) {
             $realNode.InnerText = '1'; $stdNode.InnerText = '1'; $synth++
         }
     }
-    if ($RealTime -gt 0) {
-        $n = $doc.SelectSingleNode('//Title/User/Time/RealTime')
-        if ($n) { $n.InnerText = "$RealTime" }
+    # 2.2a 服务端「用时」= 提交时刻 - 进实验时刻，两个时间都由服务端打点
+    #      要让页面显示 30~50 分钟，只能让这次提交真的发生在「开始 + 30~50 分钟」之后
+    $waitRt = $null
+    if ($WaitRandomTime) {
+        $startAt = Resolve-LabStart $f $startMap
+        if ($startAt) {
+            $want = Get-RandomRealTime -MinSeconds $RealTimeMin -MaxSeconds $RealTimeMax
+            $targetAt = $startAt.AddSeconds($want)
+            Log2 ("  进实验时间 {0}，目标用时 {1} 分 {2:00} 秒 → 计划 {3} 提交" -f $startAt.ToString('HH:mm:ss'), [int][Math]::Floor($want / 60), ($want % 60), $targetAt.ToString('HH:mm:ss'))
+            if ($Apply) {
+                if ((Get-Date) -gt $targetAt) {
+                    Log2 ("  已经过了目标时间（开始到现在 {0} 分钟），直接提交" -f [int][Math]::Floor(((Get-Date) - $startAt).TotalMinutes))
+                }
+                while ((Get-Date) -lt $targetAt) {
+                    $remain = [int][Math]::Floor(($targetAt - (Get-Date)).TotalSeconds)
+                    if ($remain -le 0) { break }
+                    Log2 ("    等待中… 还剩 {0} 分 {1:00} 秒" -f [int][Math]::Floor($remain / 60), ($remain % 60))
+                    Start-Sleep -Seconds ([Math]::Min(60, [Math]::Max(1, $remain)))
+                }
+                $waitRt = [int][Math]::Max(1, [Math]::Floor(((Get-Date) - $startAt).TotalSeconds))
+                Log2 ("  提交时刻 {0}，服务端应记为 {1} 分 {2:00} 秒" -f (Get-Date).ToString('HH:mm:ss'), [int][Math]::Floor($waitRt / 60), ($waitRt % 60))
+                if ($waitRt -gt $RealTimeMax) {
+                    Log2 ("  注意：实际已过 {0} 分钟，超过设定的上限 {1} 分钟，只能按实际算" -f [int][Math]::Floor($waitRt / 60), [int][Math]::Floor($RealTimeMax / 60))
+                }
+            } else {
+                $waitRt = $want
+                Log2 "  [DryRun] 不加 -Apply 不会真的等；真正提交时会等到上面那个时间点"
+            }
+        } else {
+            Write-Warning "  日志里没有这条实验的开始时间（SetLabTimeRecordStart），算不出用时，本次照常提交"
+        }
+    }
+
+    # 2.2b 改「用时」：Title/User/Time/RealTime（单位：秒）
+    $rtNow = $null
+    if ($waitRt) { $rtNow = $waitRt }
+    elseif ($RandomTime) { $rtNow = Get-RandomRealTime -MinSeconds $RealTimeMin -MaxSeconds $RealTimeMax }
+    elseif ($RealTime -gt 0) { $rtNow = $RealTime }
+    if ($rtNow -and ($waitRt -or -not $KeepRealTime)) {
+        $timeNode = $doc.SelectSingleNode('//Title/User/Time')
+        if (-not $timeNode) {
+            # 少数包没有 Time 节点：按 ExamPaper/Title/User 结构补一个
+            $userNode = $doc.SelectSingleNode('//Title/User')
+            if ($userNode) {
+                $timeNode = $doc.CreateElement('Time')
+                $userNode.AppendChild($timeNode) | Out-Null
+            }
+        }
+        if ($timeNode) {
+            $rtNode = $timeNode.SelectSingleNode('RealTime')
+            if (-not $rtNode) { $rtNode = $doc.CreateElement('RealTime'); $timeNode.AppendChild($rtNode) | Out-Null }
+            $rtNode.InnerText = "$rtNow"
+            $mm = [int][Math]::Floor($rtNow / 60); $ss = [int]($rtNow % 60)
+            Log2 ("  用时 RealTime -> {0} 秒（{1}:{2:00}）" -f $rtNow, $mm, $ss)
+        } else {
+            Write-Warning "  找不到 Title/User/Time 节点，用时未修改（$tag）"
+        }
     }
     Log2 ("  填入 {0} 格 / 反填 {1} 格 / 补造 {2} 格" -f $filled, $mirrored, $synth)
 
