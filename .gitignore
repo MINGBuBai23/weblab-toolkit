@@ -1,0 +1,11 @@
+# 运行残留（含账号、服务器地址、提交数据），不要提交
+tools/capture/
+tools/proxy-state.json
+
+# 临时/备份
+*.bak
+*.tmp
+*.dec.xml
+
+# 构建产物（如需分发可保留）
+# tools/*.exe
