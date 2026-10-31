@@ -89,12 +89,19 @@
 cd tools
 .\Invoke-LabPerfect.ps1 -Apply -All         # 处理日志里所有实验（自动去重）
 .\Invoke-LabPerfect.ps1 -Report -Last 5     # 只看评分结构，判断上限
-.\Invoke-LabPerfect.ps1 -Apply -WaitRandomTime    # 页面「用时」由服务端算：等到「开始+30~50 分钟」再提交
-.\Invoke-LabPerfect.ps1 -Apply -RandomTime      # 只改 XML 里的 RealTime（页面用时不变）
+.\Invoke-LabPerfect.ps1 -Apply -WaitRandomTime    # 按本地日志开始时间延时重放，不保证改变网页用时
+.\Invoke-LabPerfect.ps1 -Apply -RandomTime      # 只改 XML 里的 RealTime，不保证影响网页用时
 .\Invoke-LabPerfect.ps1 -Apply -RandomTime -RealTimeMin 1500 -RealTimeMax 2400   # 自定义 25~40 分钟
 .\Invoke-LabPerfect.ps1 -Apply -RealTime 1800   # 固定 30 分钟
 .\Invoke-LabPerfect.ps1 -Apply -KeepRealTime    # 保留包里的原始用时（默认行为）
+.\Invoke-LabPerfect.ps1 -Apply -WaitRandomTime -KeepRealTime   # 延时重放，但保留 XML 原用时
 ```
+
+`-WaitRandomTime` 仅控制本地重放时刻，默认目标为日志开始时间后 30~50 分钟；
+目标已过时直接重放。**未验证服务端是否会因重放更新结束时间，不保证网页显示 30~50 分钟。**
+如果服务端只保留首次提交时间，延时重放不会改变网页用时。延时模式会先检查所有选中记录，
+缺少提交时间戳或对应开始记录时整批报错中止，不发送任何记录；`-Report` 仅查看评分结构，不做延时检查。
+`-KeepRealTime` 优先于所有 XML 用时修改选项，包括延时模式，但不取消等待。
 
 ---
 
@@ -193,3 +200,10 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 Component.dll 是可选依赖：仓库里带了就从同目录加载，没带则自动去
 %TEMP%\lab\<编号>\ 找（启动过一次实验后就有）。如果你不想在仓库里放第三方二进制，
 直接删掉这个 dll 即可，工具会提示你从客户端复制。
+
+## 十一、离线回归测试
+
+在仓库根目录运行 `powershell -NoProfile -File tests/Test-DelayedSubmission.ps1`，
+也可使用 `pwsh`。测试使用合成日志、模拟时钟、模拟 HTTP 请求和临时编译的编解码桩，
+不连接实验平台；覆盖开始时间匹配、缺失记录时整批中止、保留 XML 用时和 DryRun 行为。
+这些测试不验证服务端是否更新结束时间或网页显示。

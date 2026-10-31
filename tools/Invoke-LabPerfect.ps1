@@ -21,7 +21,7 @@ param(
     [int]$Last = 1,            # 只处理最近 N 条（-All 优先）
     [int]$RealTime = -1,       # >0 则把 RealTime 改成这个固定秒数
     [switch]$RandomTime,       # 随机用时：在 RealTimeMin ~ RealTimeMax 之间随机
-    [switch]$WaitRandomTime,   # 页面「用时」= 服务端（提交时间-进实验时间），所以先等到「开始+随机时长」再提交
+    [switch]$WaitRandomTime,   # 按本地抓包开始时间延时提交；不保证改变服务端显示用时
     [int]$RealTimeMin = 1800,  # 随机下限（秒）1800 = 30 分钟
     [int]$RealTimeMax = 3000,  # 随机上限（秒）3000 = 50 分钟
     [switch]$KeepRealTime,     # 保留包里原始用时，不做任何修改
@@ -109,7 +109,7 @@ function Resolve-LabStart($f, $startMap) {
     if (-not $startMap.ContainsKey($k)) { return $null }
     $best = $null
     foreach ($t in $startMap[$k]) {
-        if ($t -le $f['__Time'].AddMinutes(1) -and (-not $best -or $t -gt $best)) { $best = $t }
+        if ($t -le $f['__Time'] -and (-not $best -or $t -gt $best)) { $best = $t }
     }
     return $best
 }
@@ -154,6 +154,18 @@ if (-not $All) {
 }
 Log2 ("找到 {0} 条提交（本次处理 {1} 条）" -f $chunks.Count, $subs.Count)
 $startMap = Get-LabStartMap $allChunks
+
+# 延时模式先校验全部待处理记录，避免缺开始时间时直接发送或批量执行到一半才失败。
+if ($WaitRandomTime -and -not $Report) {
+    foreach ($f in $subs) {
+        $startAt = Resolve-LabStart $f $startMap
+        if (-not $startAt) {
+            throw "延时模式中止：LabID=$($f['LabID']) / RecordID=$($f['RecordID']) 缺少不晚于提交时间的开始记录（SetLabTimeRecordStart）或提交时间戳；未发送任何记录。请补全抓包日志。"
+        }
+        $f['__StartAt'] = $startAt
+    }
+    Log2 '  延时模式只控制本地重放时刻；服务端是否更新结束时间未经验证，网页用时可能保持不变。'
+}
 
 # ---------- 2. 逐条处理 ----------
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ("lpf_" + [guid]::NewGuid().ToString('N'))
@@ -260,11 +272,10 @@ foreach ($f in $subs) {
             $realNode.InnerText = '1'; $stdNode.InnerText = '1'; $synth++
         }
     }
-    # 2.2a 服务端「用时」= 提交时刻 - 进实验时刻，两个时间都由服务端打点
-    #      要让页面显示 30~50 分钟，只能让这次提交真的发生在「开始 + 30~50 分钟」之后
+    # 2.2a 按本地日志时间等待；服务端是否接受重放来更新结束时间未经验证。
     $waitRt = $null
     if ($WaitRandomTime) {
-        $startAt = Resolve-LabStart $f $startMap
+        $startAt = $f['__StartAt']
         if ($startAt) {
             $want = Get-RandomRealTime -MinSeconds $RealTimeMin -MaxSeconds $RealTimeMax
             $targetAt = $startAt.AddSeconds($want)
@@ -275,21 +286,20 @@ foreach ($f in $subs) {
                 }
                 while ((Get-Date) -lt $targetAt) {
                     $remain = [int][Math]::Floor(($targetAt - (Get-Date)).TotalSeconds)
-                    if ($remain -le 0) { break }
                     Log2 ("    等待中… 还剩 {0} 分 {1:00} 秒" -f [int][Math]::Floor($remain / 60), ($remain % 60))
                     Start-Sleep -Seconds ([Math]::Min(60, [Math]::Max(1, $remain)))
                 }
                 $waitRt = [int][Math]::Max(1, [Math]::Floor(((Get-Date) - $startAt).TotalSeconds))
-                Log2 ("  提交时刻 {0}，服务端应记为 {1} 分 {2:00} 秒" -f (Get-Date).ToString('HH:mm:ss'), [int][Math]::Floor($waitRt / 60), ($waitRt % 60))
+                Log2 ("  本地提交时刻 {0}，距日志开始时间 {1} 分 {2:00} 秒（不代表服务端用时）" -f (Get-Date).ToString('HH:mm:ss'), [int][Math]::Floor($waitRt / 60), ($waitRt % 60))
                 if ($waitRt -gt $RealTimeMax) {
-                    Log2 ("  注意：实际已过 {0} 分钟，超过设定的上限 {1} 分钟，只能按实际算" -f [int][Math]::Floor($waitRt / 60), [int][Math]::Floor($RealTimeMax / 60))
+                    Log2 ("  注意：本地实际已过 {0} 分钟，超过设定的上限 {1} 分钟" -f [int][Math]::Floor($waitRt / 60), [int][Math]::Floor($RealTimeMax / 60))
                 }
             } else {
                 $waitRt = $want
                 Log2 "  [DryRun] 不加 -Apply 不会真的等；真正提交时会等到上面那个时间点"
             }
         } else {
-            Write-Warning "  日志里没有这条实验的开始时间（SetLabTimeRecordStart），算不出用时，本次照常提交"
+            throw '延时模式中止：缺少已校验的开始时间，未发送本条记录。'
         }
     }
 
@@ -298,7 +308,7 @@ foreach ($f in $subs) {
     if ($waitRt) { $rtNow = $waitRt }
     elseif ($RandomTime) { $rtNow = Get-RandomRealTime -MinSeconds $RealTimeMin -MaxSeconds $RealTimeMax }
     elseif ($RealTime -gt 0) { $rtNow = $RealTime }
-    if ($rtNow -and ($waitRt -or -not $KeepRealTime)) {
+    if ($rtNow -and -not $KeepRealTime) {
         $timeNode = $doc.SelectSingleNode('//Title/User/Time')
         if (-not $timeNode) {
             # 少数包没有 Time 节点：按 ExamPaper/Title/User 结构补一个
